@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# harmony-fix — recover the Harmony SASE macOS VPN from the privileged-daemon
+# migration deadlock. See --help for the runbook.
+#
+# Tested on Harmony SASE 12.7.4 (build 9577) / macOS 26.4.1.
+#
+# It does root-level "tamper" things (clears schg, replaces files under /Library)
+# on purpose: the vendor's own retry runs unprivileged and can't clear its
+# schg-locked bundle or the launchd 'disabled' flag. We supply root and reinstall
+# the daemon the way the vendor's installer does — touching only the daemon
+# bundle and its plist. See the Check Point bug report for the root cause.
+#
+# Three shapes of the same bug, all leaving the app unable to reach its daemon:
+#   A) bundle present but empty/locked (daemon binary missing or schg-immutable)
+#   B) bundle intact but the daemon disabled/unloaded in launchd (e.g. post-reboot)
+#   C) bundle missing entirely
+# Fix: make sure the bundle exists (restore from the app payload for A/C), clear
+# the launchd 'disabled' override, then enable + bootstrap the daemon as root.
+
+set -euo pipefail
+
+APP="/Applications/Harmony SASE.app"
+SRC_BUNDLE="$APP/Contents/Library/LaunchServices/com.perimeter81d.app"
+SRC_BIN="$SRC_BUNDLE/Contents/MacOS/com.perimeter81d"
+BUNDLE="/Library/PrivilegedHelperTools/com.perimeter81d.app"
+DAEMON_BIN="$BUNDLE/Contents/MacOS/com.perimeter81d"
+DAEMON_PLIST="/Library/LaunchDaemons/com.perimeter81d.plist"
+DAEMON_LABEL="com.perimeter81d"
+DI_LOG="/var/log/HarmonySASE/DaemonInstaller.log"
+AGENT_LOG="$HOME/Library/Logs/HarmonySASE.log"
+
+# Org-specific, non-secret overrides — set in the environment or in an env file
+# (default ~/.config/harmony-sase-fix.env); safe generic defaults apply otherwise.
+: "${HARMONY_FIX_ENV:=$HOME/.config/harmony-sase-fix.env}"
+# shellcheck source=/dev/null
+[[ -f "$HARMONY_FIX_ENV" ]] && . "$HARMONY_FIX_ENV"
+ACCESS_DOC_URL="${HARMONY_FIX_ACCESS_URL:-}"
+ESCALATE_TO="${HARMONY_FIX_ESCALATE:-Contact your VPN / IT administrator.}"
+REINSTALL_SRC="${HARMONY_FIX_REINSTALL_SRC:-your MDM or the vendor download}"
+ACCESS_HINT="Ask your VPN/IT admin how to re-request access."
+[[ -n "$ACCESS_DOC_URL" ]] && ACCESS_HINT="Guide: $ACCESS_DOC_URL"
+
+AUTH_OK_RE="SDP login successfully passed"        # authorized
+AUTH_RELOGIN_RE="SDP login failed"                # "please login again" → re-login
+AUTH_EXPIRED_RE="We don't recognize your device"  # DPCCheckFailed → re-request access (30-day)
+
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+warn() { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+fail() { printf '[%s] ERROR: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+harmony-fix — recover Harmony SASE macOS VPN from the daemon-migration deadlock
+Tested on Harmony SASE 12.7.4 (build 9577) / macOS 26.4.1.
+
+USAGE
+  harmony-fix              detect + repair if wedged (one sudo prompt)
+  harmony-fix --check      detect only; exit 0=healthy 2=wedged 3=other
+                           4=access expired 5=re-login
+  harmony-fix --dry-run    show plan, no changes
+  harmony-fix --help       this text
+
+AUTHORIZATION vs DAEMON
+  This script only repairs the local daemon. Exit 4/5 mean the blocker is
+  server-side authorization, not the daemon — repair is skipped:
+    4  device/access expired (30-day) — re-request access, see below
+    5  session expired — just sign in again in the app
+  $ACCESS_HINT
+
+DETECT (manual, no script)
+  launchctl print system/com.perimeter81d            # "Could not find service" = not loaded
+  launchctl print-disabled system | grep perimeter   # "=> disabled" blocks loading
+  ls /Library/PrivilegedHelperTools/com.perimeter81d.app/Contents   # empty/missing = broken
+  grep -Ec "Helper|daemon isn't avaiable" ~/Library/Logs/HarmonySASE.log
+  grep -n "We don't recognize your device" ~/Library/Logs/HarmonySASE.log  # access expired (30-day)
+  grep -n "SDP login failed" ~/Library/Logs/HarmonySASE.log                # session expired, re-login
+
+WHAT IT DOES
+  1. Quits the Harmony SASE app.
+  2. Ensures the daemon bundle exists under /Library/PrivilegedHelperTools,
+     restoring it from the app payload if it's empty, locked, or missing.
+  3. Clears the launchd 'disabled' override, then enable + bootstrap the daemon.
+  4. Relaunches the app; polls up to 60s for com.perimeter81d to register.
+
+AFTER
+  VPN tunnel auto-establishes once the daemon registers (no clicks).
+  The SWG proxy extension may show "activated waiting for user" — only
+  approve if your workspace uses SWG (System Settings → Login Items &
+  Extensions → Network Extensions). The VPN tunnel does NOT need it.
+
+WHEN THIS SCRIPT WON'T HELP
+  --check returns 3      bundle is in neither known shape; don't touch
+                         anything, investigate manually.
+  "source payload missing" error    /Applications/Harmony SASE.app is broken;
+                                    reinstall from $REINSTALL_SRC first.
+  daemon doesn't register within 60s    check /var/log/HarmonySASE/DaemonInstaller.log
+                                        for new "copyDaemon failed" / EPERM.
+
+ESCALATE
+  $ESCALATE_TO
+  Capture logs BEFORE re-running the fix (the cleanup overwrites the wedged
+  state); see the upstream Check Point bug report for the collection recipe.
+EOF
+}
+
+# --- state probes ---
+bundle_is_wedged() { [[ -d "$BUNDLE" && ! -x "$DAEMON_BIN" ]]; }
+bundle_is_healthy(){ [[ -x "$DAEMON_BIN" && -f "$DAEMON_PLIST" ]]; }
+daemon_loaded()    { /bin/launchctl print "system/$DAEMON_LABEL" >/dev/null 2>&1; }
+app_running()      { /usr/bin/pgrep -x "Harmony SASE" >/dev/null 2>&1; }
+
+# --- shared actions ---
+require_src_payload() {
+  [[ -x "$SRC_BIN" ]] || fail "source daemon payload missing: $SRC_BIN — reinstall the app from $REINSTALL_SRC first."
+}
+
+quit_app() {
+  log "quitting Harmony SASE app"
+  /usr/bin/osascript -e 'quit app "Harmony SASE"' >/dev/null 2>&1 || true
+  sleep 2
+  if /usr/bin/pgrep -x "Harmony SASE" >/dev/null; then
+    /usr/bin/pkill -x "Harmony SASE" || true
+    sleep 1
+  fi
+}
+
+launch_app()      { /usr/bin/open -a "Harmony SASE"; }
+clear_immutable() { /usr/bin/sudo /usr/bin/chflags -R noschg "$@"; }
+
+# Yes/no prompt — only interactive during a real repair on a TTY; silent (no)
+# otherwise, so --check/--dry-run never prompt or open anything.
+confirm() {
+  [[ "$MODE" == "repair" && -t 0 ]] || return 1
+  local reply
+  printf '[%s] %s [y/N] ' "$(date +%H:%M:%S)" "$1" >&2
+  read -r reply
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# Replace the daemon bundle + plist with a fresh copy from the app payload —
+# the same cp recipe the vendor's DaemonInstaller runs, but done as root.
+restore_bundle() {
+  require_src_payload
+  log "restoring daemon bundle from app payload"
+  [[ -e "$BUNDLE" ]] && clear_immutable "$BUNDLE"
+  /usr/bin/sudo /bin/rm -rf "$BUNDLE"
+  /usr/bin/sudo /bin/cp -R "$SRC_BUNDLE" "$(/usr/bin/dirname "$BUNDLE")/"
+  [[ -f "$DAEMON_PLIST" ]] && clear_immutable "$DAEMON_PLIST"
+  /usr/bin/sudo /bin/cp "$BUNDLE/Contents/Resources/$DAEMON_LABEL.plist" "$DAEMON_PLIST"
+}
+
+# Clear any half-registration, lift the 'disabled' override (this is what blocks
+# bootstrap with "Input/output error"), then load. `enable` is required because
+# bootstrap — unlike the legacy `load -w` — refuses to load a disabled service.
+load_daemon() {
+  log "enabling + bootstrapping $DAEMON_LABEL"
+  /usr/bin/sudo /bin/launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+  /usr/bin/sudo /bin/launchctl enable "system/$DAEMON_LABEL"
+  /usr/bin/sudo /bin/launchctl bootstrap system "$DAEMON_PLIST" 2>&1 | /usr/bin/sed 's/^/    /' || true
+}
+
+poll_for_daemon() {
+  log "polling for $DAEMON_LABEL registration (up to 60s)"
+  local i
+  for i in $(/usr/bin/seq 1 30); do
+    sleep 2
+    if daemon_loaded; then log "$DAEMON_LABEL REGISTERED after ~$((i*2))s"; return 0; fi
+  done
+  return 1
+}
+
+verify_daemon() {
+  log "verification:"
+  daemon_loaded || return 1
+  /bin/launchctl print "system/$DAEMON_LABEL" 2>&1 \
+    | /usr/bin/grep -E 'state =|pid =|program =' | /usr/bin/sed 's/^/    /'
+  [[ -x "$DAEMON_BIN" ]] || fail "daemon binary missing after repair: $DAEMON_BIN"
+  log "bundle: $DAEMON_BIN present ($(/usr/bin/stat -f '%z bytes' "$DAEMON_BIN"))"
+}
+
+report_agent_log() {
+  [[ -f "$AGENT_LOG" ]] || return 0
+  local pattern label hits
+  if [[ "${1:-}" == "B" ]]; then
+    pattern="daemon isn't avaiable|Daemon is not initialised|Failed to retrieve job dictionary from launchd"
+    label="daemon-unavailable"
+  else
+    pattern="Unable to connect to Helper although it is installed"
+    label="connect-loop"
+  fi
+  hits=$(/usr/bin/grep -cE "$pattern" "$AGENT_LOG" 2>/dev/null) || hits=0
+  log "agent $label hits in HarmonySASE.log: $hits"
+}
+
+# Triage authorization before touching the daemon: a re-login or expired-access
+# rejection is server-side, so daemon repair can't help. Reads today's LAST auth
+# outcome (a later success supersedes an earlier failure) and bails with guidance.
+check_auth() {
+  [[ -f "$AGENT_LOG" ]] || return 0
+  local today line
+  today=$(date +%y-%m-%d)
+  line=$(/usr/bin/grep -E "^$today .*($AUTH_OK_RE|$AUTH_RELOGIN_RE|$AUTH_EXPIRED_RE)" \
+           "$AGENT_LOG" 2>/dev/null | /usr/bin/tail -1) || true
+  [[ -n "$line" ]] || return 0
+  case "$line" in
+    *"$AUTH_EXPIRED_RE"*)
+      warn "Harmony doesn't recognize this device — VPN access has expired (30-day re-approval)."
+      log  "ACTION: request VPN access again, then sign in. Not a daemon problem — skipping repair."
+      log  "  $ACCESS_HINT"
+      if [[ -n "$ACCESS_DOC_URL" ]]; then
+        confirm "Open the access-request guide?" && /usr/bin/open "$ACCESS_DOC_URL"
+      fi
+      exit 4 ;;
+    *"$AUTH_RELOGIN_RE"*)
+      warn "Harmony session expired (\"please login again\")."
+      log  "ACTION: sign in again in the Harmony SASE app. Not a daemon problem — skipping repair."
+      confirm "Open the Harmony SASE app to sign in?" && launch_app
+      exit 5 ;;
+  esac
+  return 0
+}
+
+# --- repair strategies ---
+# Variant B: bundle is intact — leave it in place, just enable + load.
+repair_surgical() {
+  quit_app
+  log "clearing schg on bundle + plist (will prompt for sudo password)"
+  clear_immutable "$BUNDLE" "$DAEMON_PLIST"
+  load_daemon
+  log "relaunching Harmony SASE.app"
+  launch_app
+  poll_for_daemon
+}
+
+# Variants A/C (and variant-B fallback): restore the bundle from the app payload,
+# then enable + load.
+repair_rebuild() {
+  quit_app
+  log "rebuilding daemon bundle (will prompt for sudo password)"
+  restore_bundle
+  load_daemon
+  log "relaunching Harmony SASE.app"
+  launch_app
+  poll_for_daemon
+}
+
+# --- arg parsing ---
+MODE="repair"
+for arg in "$@"; do
+  case "$arg" in
+    --check)        MODE="check" ;;
+    --dry-run)      MODE="dryrun" ;;
+    -h|--help)      usage; exit 0 ;;
+    *) echo "unknown arg: $arg (try --help)" >&2; exit 64 ;;
+  esac
+done
+
+# --- auth triage (before any daemon work) ---
+check_auth
+
+# --- detect ---
+log "checking Harmony SASE daemon state"
+
+WEDGE_KIND=""
+if bundle_is_healthy; then
+  if daemon_loaded; then
+    log "HEALTHY — bundle populated, $DAEMON_LABEL running. Nothing to do."
+    exit 0
+  elif app_running; then
+    WEDGE_KIND="B"
+    log "DETECTED wedged state (B): bundle populated but $DAEMON_LABEL is NOT loaded"
+    log "  in launchd while the Harmony app is running — VPN can't reach its daemon."
+  else
+    log "HEALTHY — bundle populated, plist in place. Daemon not currently loaded"
+    log "  (normal when the Harmony app is closed; launchd loads it on demand)."
+    exit 0
+  fi
+elif bundle_is_wedged; then
+  WEDGE_KIND="A"
+  log "DETECTED wedged state (A): $BUNDLE exists but $DAEMON_BIN is missing/locked"
+elif [[ ! -d "$BUNDLE" ]]; then
+  WEDGE_KIND="C"
+  log "DETECTED wedged state (C): daemon bundle $BUNDLE is missing entirely"
+else
+  warn "bundle is in an unrecognised state (not wedged, not fully populated)."
+  warn "This script only handles the known wedge shapes. Investigate manually."
+  exit 3
+fi
+
+report_agent_log "$WEDGE_KIND"
+
+[[ "$MODE" == "check" ]] && exit 2
+
+# --- plan ---
+if [[ "$WEDGE_KIND" == "B" ]]; then
+  log "plan (surgical — bundle intact, enable + load in place):"
+  log "  1) quit Harmony SASE.app"
+  log "  2) sudo chflags -R noschg bundle + plist"
+  log "  3) sudo launchctl enable + bootstrap $DAEMON_LABEL"
+  log "  4) open -a 'Harmony SASE'; poll up to 60s (rebuild as fallback)"
+else
+  require_src_payload
+  log "plan (rebuild — restore bundle from the app payload, then enable + load):"
+  log "  1) quit Harmony SASE.app"
+  log "  2) restore $BUNDLE + plist from the app payload (sudo)"
+  log "  3) sudo launchctl enable + bootstrap $DAEMON_LABEL"
+  log "  4) open -a 'Harmony SASE'; poll up to 60s for $DAEMON_LABEL"
+fi
+
+[[ "$MODE" == "dryrun" ]] && { log "dry-run: stopping here."; exit 0; }
+
+# --- act ---
+if [[ "$WEDGE_KIND" == "B" ]]; then
+  if ! repair_surgical; then
+    warn "in-place load did not register the daemon; falling back to bundle rebuild."
+    repair_rebuild || true
+  fi
+else
+  repair_rebuild || true
+fi
+
+# --- verify ---
+verify_daemon || fail "$DAEMON_LABEL failed to register within timeout. Check $DI_LOG."
+log "DONE. VPN tunnel should auto-establish. SWG proxy approval optional (see --help)."
