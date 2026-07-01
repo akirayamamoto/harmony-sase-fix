@@ -1,5 +1,7 @@
 # harmony-sase-fix
 
+> **⚠️ Review this script before you run it. It runs `sudo` and modifies files under `/Library`. Provided as-is, use at your own risk.**
+
 Recover the **Harmony SASE** (Check Point, formerly Perimeter 81) macOS VPN when
 it won't connect because its privileged helper daemon is wedged — a vendor bug
 where the daemon migration leaves the helper empty, locked (`schg`), disabled in
@@ -49,14 +51,16 @@ harmony-fix --help      # full runbook
 ## Optional configuration
 
 Org-specific hints (access-request guide, escalation contact, where to reinstall
-the app) come from environment variables or an env file at
-`~/.config/harmony-sase-fix.env`; generic defaults apply otherwise:
+the app) are optional — generic defaults apply otherwise. To set them, copy the
+template and edit:
 
 ```sh
-HARMONY_FIX_ACCESS_URL="https://your-wiki/vpn-access"
-HARMONY_FIX_ESCALATE="Contact your VPN / IT admin."
-HARMONY_FIX_REINSTALL_SRC="your MDM / self-service portal"
+cp .env.example ~/.config/harmony-sase-fix.env
+"$EDITOR" ~/.config/harmony-sase-fix.env
 ```
+
+Or export the variables directly, or point `HARMONY_FIX_ENV` at any file. See
+[`.env.example`](.env.example) for the full list.
 
 ## License
 
