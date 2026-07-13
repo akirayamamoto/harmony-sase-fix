@@ -29,15 +29,19 @@ tamper with the daemon when the real problem is just a login.
 ## Install (macOS)
 
 ```sh
-git clone https://github.com/akirayamamoto/harmony-sase-fix.git
-cd harmony-sase-fix
-
-# symlink onto your PATH — pick one:
-ln -sf "$PWD/harmony-fix" ~/.local/bin/harmony-fix     # if ~/.local/bin is on PATH
-sudo ln -sf "$PWD/harmony-fix" /usr/local/bin/harmony-fix   # system-wide
+brew install akirayamamoto/tap/harmony-fix
 ```
 
-If macOS quarantines the script, clear it with `xattr -d com.apple.quarantine harmony-fix`.
+Or, without Homebrew — clone and symlink (lets you review the script first):
+
+```sh
+git clone https://github.com/akirayamamoto/harmony-sase-fix.git
+cd harmony-sase-fix
+ln -sf "$PWD/harmony-fix" ~/.local/bin/harmony-fix        # if ~/.local/bin is on PATH
+# or system-wide: sudo ln -sf "$PWD/harmony-fix" /usr/local/bin/harmony-fix
+```
+
+If macOS quarantines the manually-downloaded script, clear it with `xattr -d com.apple.quarantine harmony-fix`.
 
 ## Usage
 
