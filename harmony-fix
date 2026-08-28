@@ -46,6 +46,7 @@ AUTH_OK_RE="SDP login successfully passed"        # authorized
 AUTH_RELOGIN_RE="SDP login failed"                # "please login again" → re-login
 AUTH_EXPIRED_RE="We don't recognize your device"  # DPCCheckFailed → re-request access (30-day)
 XPC_STALE_RE="Can't login - daemon isn't available"  # app lost the daemon, needs a restart
+APP_START_RE="Application pid:"                      # agent log marker for a fresh app launch
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -122,12 +123,15 @@ app_running()      { /usr/bin/pgrep -x "Harmony SASE" >/dev/null 2>&1; }
 
 # The daemon can be loaded and healthy while the app still holds the dead
 # connection it cached at startup; the app never retries, so its last sign-in
-# attempt stays "daemon isn't available" until it restarts. A later successful
-# login supersedes an earlier failure, so compare the last of the two.
+# attempt stays "daemon isn't available" until it restarts. Only the running
+# instance's attempts count — anything logged before the last launch belongs to
+# a process that no longer exists — and a later success supersedes an earlier
+# failure, so compare the last of the two within that window.
 app_lost_daemon() {
   [[ -f "$AGENT_LOG" ]] || return 1
-  local last
-  last=$(/usr/bin/grep -E "$XPC_STALE_RE|$AUTH_OK_RE" "$AGENT_LOG" 2>/dev/null | /usr/bin/tail -1) || true
+  local start last
+  start=$(/usr/bin/grep -n "$APP_START_RE" "$AGENT_LOG" | /usr/bin/tail -1 | /usr/bin/cut -d: -f1) || return 1
+  last=$(/usr/bin/tail -n "+$start" "$AGENT_LOG" | /usr/bin/grep -E "$XPC_STALE_RE|$AUTH_OK_RE" | /usr/bin/tail -1) || true
   [[ "$last" == *"$XPC_STALE_RE"* ]]
 }
 
