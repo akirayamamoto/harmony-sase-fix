@@ -10,10 +10,12 @@
 # the daemon the way the vendor's installer does — touching only the daemon
 # bundle and its plist. See the Check Point bug report for the root cause.
 #
-# Three shapes of the same bug, all leaving the app unable to reach its daemon:
+# Four shapes of the same bug, all leaving the app unable to reach its daemon:
 #   A) bundle present but empty/locked (daemon binary missing or schg-immutable)
 #   B) bundle intact but the daemon disabled/unloaded in launchd (e.g. post-reboot)
 #   C) bundle missing entirely
+#   D) daemon loaded and healthy, but the app is still holding the dead
+#      connection it cached at startup — restarting the app is the whole fix
 # Fix: make sure the bundle exists (restore from the app payload for A/C), clear
 # the launchd 'disabled' override, then enable + bootstrap the daemon as root.
 
@@ -43,6 +45,7 @@ ACCESS_HINT="Ask your VPN/IT admin how to re-request access."
 AUTH_OK_RE="SDP login successfully passed"        # authorized
 AUTH_RELOGIN_RE="SDP login failed"                # "please login again" → re-login
 AUTH_EXPIRED_RE="We don't recognize your device"  # DPCCheckFailed → re-request access (30-day)
+XPC_STALE_RE="Can't login - daemon isn't available"  # app lost the daemon, needs a restart
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -67,6 +70,13 @@ AUTHORIZATION vs DAEMON
     5  session expired — just sign in again in the app
   $ACCESS_HINT
 
+WHY IT KEEPS COMING BACK
+  Signing out in the app is the usual trigger: the daemon's own logout path
+  shells out to 'launchctl unload', which writes a persistent 'disabled'
+  override in launchd. The app runs unprivileged and can't clear it, so the
+  next launch can't reach the daemon and can't sign you back in. Quitting the
+  app instead of signing out avoids the cycle.
+
 DETECT (manual, no script)
   launchctl print system/com.perimeter81d            # "Could not find service" = not loaded
   launchctl print-disabled system | grep perimeter   # "=> disabled" blocks loading
@@ -80,7 +90,8 @@ WHAT IT DOES
   2. Ensures the daemon bundle exists under /Library/PrivilegedHelperTools,
      restoring it from the app payload if it's empty, locked, or missing.
   3. Clears the launchd 'disabled' override, then enable + bootstrap the daemon.
-  4. Relaunches the app; polls up to 60s for com.perimeter81d to register.
+  4. Polls up to 60s for com.perimeter81d to register, then relaunches the app
+     (in that order — the app caches a dead connection if it starts first).
 
 AFTER
   VPN tunnel auto-establishes once the daemon registers (no clicks).
@@ -108,6 +119,17 @@ bundle_is_wedged() { [[ -d "$BUNDLE" && ! -x "$DAEMON_BIN" ]]; }
 bundle_is_healthy(){ [[ -x "$DAEMON_BIN" && -f "$DAEMON_PLIST" ]]; }
 daemon_loaded()    { /bin/launchctl print "system/$DAEMON_LABEL" >/dev/null 2>&1; }
 app_running()      { /usr/bin/pgrep -x "Harmony SASE" >/dev/null 2>&1; }
+
+# The daemon can be loaded and healthy while the app still holds the dead
+# connection it cached at startup; the app never retries, so its last sign-in
+# attempt stays "daemon isn't available" until it restarts. A later successful
+# login supersedes an earlier failure, so compare the last of the two.
+app_lost_daemon() {
+  [[ -f "$AGENT_LOG" ]] || return 1
+  local last
+  last=$(/usr/bin/grep -E "$XPC_STALE_RE|$AUTH_OK_RE" "$AGENT_LOG" 2>/dev/null | /usr/bin/tail -1) || true
+  [[ "$last" == *"$XPC_STALE_RE"* ]]
+}
 
 # --- shared actions ---
 require_src_payload() {
@@ -169,6 +191,17 @@ poll_for_daemon() {
   return 1
 }
 
+# The app probes for the daemon once at startup and caches an unusable
+# connection if it isn't registered yet. Relaunch only after registration —
+# but relaunch either way, so a failed repair still leaves the app running.
+relaunch_when_daemon_registers() {
+  local registered=0
+  poll_for_daemon && registered=1
+  log "relaunching Harmony SASE.app"
+  launch_app
+  [[ "$registered" == 1 ]]
+}
+
 verify_daemon() {
   log "verification:"
   daemon_loaded || return 1
@@ -181,7 +214,7 @@ verify_daemon() {
 report_agent_log() {
   [[ -f "$AGENT_LOG" ]] || return 0
   local pattern label hits
-  if [[ "${1:-}" == "B" ]]; then
+  if [[ "${1:-}" == "B" || "${1:-}" == "D" ]]; then
     pattern="daemon isn't avaiable|Daemon is not initialised|Failed to retrieve job dictionary from launchd"
     label="daemon-unavailable"
   else
@@ -221,15 +254,20 @@ check_auth() {
 }
 
 # --- repair strategies ---
+# Variant D: the daemon is fine — only the app's cached connection is stale.
+repair_app_only() {
+  quit_app
+  log "relaunching Harmony SASE.app"
+  launch_app
+}
+
 # Variant B: bundle is intact — leave it in place, just enable + load.
 repair_surgical() {
   quit_app
   log "clearing schg on bundle + plist (will prompt for sudo password)"
   clear_immutable "$BUNDLE" "$DAEMON_PLIST"
   load_daemon
-  log "relaunching Harmony SASE.app"
-  launch_app
-  poll_for_daemon
+  relaunch_when_daemon_registers
 }
 
 # Variants A/C (and variant-B fallback): restore the bundle from the app payload,
@@ -239,9 +277,7 @@ repair_rebuild() {
   log "rebuilding daemon bundle (will prompt for sudo password)"
   restore_bundle
   load_daemon
-  log "relaunching Harmony SASE.app"
-  launch_app
-  poll_for_daemon
+  relaunch_when_daemon_registers
 }
 
 # --- arg parsing ---
@@ -264,8 +300,14 @@ log "checking Harmony SASE daemon state"
 WEDGE_KIND=""
 if bundle_is_healthy; then
   if daemon_loaded; then
-    log "HEALTHY — bundle populated, $DAEMON_LABEL running. Nothing to do."
-    exit 0
+    if app_running && app_lost_daemon; then
+      WEDGE_KIND="D"
+      log "DETECTED wedged state (D): $DAEMON_LABEL is loaded and healthy, but the"
+      log "  Harmony app is still holding the dead connection it cached at startup."
+    else
+      log "HEALTHY — bundle populated, $DAEMON_LABEL running. Nothing to do."
+      exit 0
+    fi
   elif app_running; then
     WEDGE_KIND="B"
     log "DETECTED wedged state (B): bundle populated but $DAEMON_LABEL is NOT loaded"
@@ -292,25 +334,31 @@ report_agent_log "$WEDGE_KIND"
 [[ "$MODE" == "check" ]] && exit 2
 
 # --- plan ---
-if [[ "$WEDGE_KIND" == "B" ]]; then
+if [[ "$WEDGE_KIND" == "D" ]]; then
+  log "plan (app-only — daemon is healthy, restart the app; no sudo needed):"
+  log "  1) quit Harmony SASE.app"
+  log "  2) open -a 'Harmony SASE'"
+elif [[ "$WEDGE_KIND" == "B" ]]; then
   log "plan (surgical — bundle intact, enable + load in place):"
   log "  1) quit Harmony SASE.app"
   log "  2) sudo chflags -R noschg bundle + plist"
   log "  3) sudo launchctl enable + bootstrap $DAEMON_LABEL"
-  log "  4) open -a 'Harmony SASE'; poll up to 60s (rebuild as fallback)"
+  log "  4) poll up to 60s for $DAEMON_LABEL, then open -a 'Harmony SASE' (rebuild as fallback)"
 else
   require_src_payload
   log "plan (rebuild — restore bundle from the app payload, then enable + load):"
   log "  1) quit Harmony SASE.app"
   log "  2) restore $BUNDLE + plist from the app payload (sudo)"
   log "  3) sudo launchctl enable + bootstrap $DAEMON_LABEL"
-  log "  4) open -a 'Harmony SASE'; poll up to 60s for $DAEMON_LABEL"
+  log "  4) poll up to 60s for $DAEMON_LABEL, then open -a 'Harmony SASE'"
 fi
 
 [[ "$MODE" == "dryrun" ]] && { log "dry-run: stopping here."; exit 0; }
 
 # --- act ---
-if [[ "$WEDGE_KIND" == "B" ]]; then
+if [[ "$WEDGE_KIND" == "D" ]]; then
+  repair_app_only
+elif [[ "$WEDGE_KIND" == "B" ]]; then
   if ! repair_surgical; then
     warn "in-place load did not register the daemon; falling back to bundle rebuild."
     repair_rebuild || true
