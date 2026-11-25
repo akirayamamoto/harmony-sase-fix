@@ -18,8 +18,8 @@ tamper with the daemon when the real problem is just a login.
 > and quits/relaunches the app. Nothing persists beyond a working daemon. Read
 > `harmony-fix --help` first, or preview with `--dry-run`.
 >
-> Tested only on **Harmony SASE 12.7.4 (build 9577) / macOS 26.4.1** — it's tied
-> to this vendor build. Re-verify before running against other versions.
+> Tested only on **Harmony SASE 12.7.4 (build 9577) and 12.10.1** (bundle rebuild on 12.7.4 only) — it's tied
+> to these vendor builds. Re-verify before running against other versions.
 
 ## Requirements
 
@@ -46,7 +46,7 @@ If macOS quarantines the manually-downloaded script, clear it with `xattr -d com
 ## Usage
 
 ```sh
-harmony-fix --check     # diagnose only — exit 0 healthy · 2 wedged · 3 unknown · 4 access expired · 5 re-login
+harmony-fix --check     # diagnose only — exit 0 healthy · 2 wedged · 3 unknown · 4 access expired · 5 re-login · 6 app stuck (reinstall)
 harmony-fix --dry-run   # show the repair plan, change nothing
 harmony-fix             # detect + repair (one sudo prompt)
 harmony-fix --help      # full runbook

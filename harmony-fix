@@ -2,7 +2,7 @@
 # harmony-fix — recover the Harmony SASE macOS VPN from the privileged-daemon
 # migration deadlock. See --help for the runbook.
 #
-# Tested on Harmony SASE 12.7.4 (build 9577) / macOS 26.4.1.
+# Tested on Harmony SASE 12.7.4 (build 9577) and 12.10.1 (rebuild path on 12.7.4 only).
 #
 # It does root-level "tamper" things (clears schg, replaces files under /Library)
 # on purpose: the vendor's own retry runs unprivileged and can't clear its
@@ -47,6 +47,8 @@ AUTH_RELOGIN_RE="SDP login failed"                # "please login again" → re-
 AUTH_EXPIRED_RE="We don't recognize your device"  # DPCCheckFailed → re-request access (30-day)
 XPC_STALE_RE="Can't login - daemon isn't available"  # app lost the daemon, needs a restart
 APP_START_RE="Application pid:"                      # agent log marker for a fresh app launch
+INSTALL_START_RE="Install daemon from app bundle start"
+INSTALL_END_RE="Install daemon from app bundle end"
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -55,12 +57,12 @@ fail() { printf '[%s] ERROR: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 usage() {
   cat <<EOF
 harmony-fix — recover Harmony SASE macOS VPN from the daemon-migration deadlock
-Tested on Harmony SASE 12.7.4 (build 9577) / macOS 26.4.1.
+Tested on Harmony SASE 12.7.4 (build 9577) and 12.10.1 (rebuild path on 12.7.4 only).
 
 USAGE
   harmony-fix              detect + repair if wedged (one sudo prompt)
   harmony-fix --check      detect only; exit 0=healthy 2=wedged 3=other
-                           4=access expired 5=re-login
+                           4=access expired 5=re-login 6=app stuck (reinstall)
   harmony-fix --dry-run    show plan, no changes
   harmony-fix --help       this text
 
@@ -103,6 +105,10 @@ AFTER
 WHEN THIS SCRIPT WON'T HELP
   --check returns 3      bundle is in neither known shape; don't touch
                          anything, investigate manually.
+  --check returns 6      the app starts reinstalling its own daemon at launch
+                         and never finishes (it hangs stopping the SWG proxy),
+                         so it never connects. Restarting repeats the hang;
+                         reinstall the app from $REINSTALL_SRC.
   "source payload missing" error    /Applications/Harmony SASE.app is broken;
                                     reinstall from $REINSTALL_SRC first.
   daemon doesn't register within 60s    check /var/log/HarmonySASE/DaemonInstaller.log
@@ -133,6 +139,23 @@ app_lost_daemon() {
   start=$(/usr/bin/grep -n "$APP_START_RE" "$AGENT_LOG" | /usr/bin/tail -1 | /usr/bin/cut -d: -f1) || return 1
   last=$(/usr/bin/tail -n "+$start" "$AGENT_LOG" | /usr/bin/grep -E "$XPC_STALE_RE|$AUTH_OK_RE" | /usr/bin/tail -1) || true
   [[ "$last" == *"$XPC_STALE_RE"* ]]
+}
+
+# The app's startup self-reinstall of the daemon (after a silent update) can hang
+# before logging its end marker; the app then never connects, and every relaunch
+# repeats the hang, so an app restart can't fix it. Same running-instance window
+# as app_lost_daemon. A healthy reinstall takes seconds, so only a start older
+# than STALL_AFTER_SECS counts — otherwise a check right after launch misfires.
+STALL_AFTER_SECS=60
+app_install_stalled() {
+  [[ -f "$AGENT_LOG" ]] || return 1
+  local start last started_at
+  start=$(/usr/bin/grep -n "$APP_START_RE" "$AGENT_LOG" | /usr/bin/tail -1 | /usr/bin/cut -d: -f1) || return 1
+  last=$(/usr/bin/tail -n "+$start" "$AGENT_LOG" \
+    | /usr/bin/grep -E "$INSTALL_START_RE|$INSTALL_END_RE" | /usr/bin/tail -1) || true
+  [[ "$last" == *"$INSTALL_START_RE"* ]] || return 1
+  started_at=$(/bin/date -j -f '%y-%m-%d %H:%M:%S' "${last:0:17}" +%s 2>/dev/null) || return 1
+  (( $(/bin/date +%s) - started_at > STALL_AFTER_SECS ))
 }
 
 # --- shared actions ---
@@ -168,11 +191,19 @@ confirm() {
 restore_bundle() {
   require_src_payload
   log "restoring daemon bundle from app payload"
-  [[ -e "$BUNDLE" ]] && clear_immutable "$BUNDLE"
-  /usr/bin/sudo /bin/rm -rf "$BUNDLE"
-  /usr/bin/sudo /bin/cp -R "$SRC_BUNDLE" "$(/usr/bin/dirname "$BUNDLE")/"
-  [[ -f "$DAEMON_PLIST" ]] && clear_immutable "$DAEMON_PLIST"
-  /usr/bin/sudo /bin/cp "$BUNDLE/Contents/Resources/$DAEMON_LABEL.plist" "$DAEMON_PLIST"
+  # Callers run under `if !` / `|| true`, which disables set -e — fail explicitly so a
+  # half-removed or missing bundle isn't left behind and misreported as a timeout.
+  if [[ -e "$BUNDLE" ]]; then
+    clear_immutable "$BUNDLE" || fail "could not clear schg on $BUNDLE"
+  fi
+  /usr/bin/sudo /bin/rm -rf "$BUNDLE" || fail "could not remove $BUNDLE"
+  /usr/bin/sudo /bin/cp -R "$SRC_BUNDLE" "$(/usr/bin/dirname "$BUNDLE")/" \
+    || fail "could not copy daemon bundle into place — $BUNDLE is now missing"
+  if [[ -f "$DAEMON_PLIST" ]]; then
+    clear_immutable "$DAEMON_PLIST" || fail "could not clear schg on $DAEMON_PLIST"
+  fi
+  /usr/bin/sudo /bin/cp "$BUNDLE/Contents/Resources/$DAEMON_LABEL.plist" "$DAEMON_PLIST" \
+    || fail "could not copy $DAEMON_PLIST"
 }
 
 # Clear any half-registration, lift the 'disabled' override (this is what blocks
@@ -303,6 +334,12 @@ log "checking Harmony SASE daemon state"
 
 WEDGE_KIND=""
 if bundle_is_healthy; then
+  if app_running && app_install_stalled; then
+    warn "the Harmony app started reinstalling its own daemon at launch and never"
+    warn "  finished, so it can't connect. Restarting the app repeats the hang."
+    log  "ACTION: reinstall Harmony SASE from $REINSTALL_SRC. Skipping repair."
+    exit 6
+  fi
   if daemon_loaded; then
     if app_running && app_lost_daemon; then
       WEDGE_KIND="D"
